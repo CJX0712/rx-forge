@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RxForge — 正则铁路图锻造炉</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3;
+    --dim:#8b949e; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; --rail:#d2a8ff;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.6 "Cascadia Code",Consolas,"Microsoft YaHei",monospace;padding:24px}
+  h1{font-size:20px;margin-bottom:4px}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:18px}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  label{color:var(--dim);font-size:12px}
+  input[type=text]{flex:1;min-width:220px;background:#0d1117;border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:8px 12px;font:inherit;outline:none}
+  input[type=text]:focus{border-color:var(--accent)}
+  button{background:#21262d;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  .presets button{padding:4px 10px;font-size:12px}
+  #verdict{font-weight:bold;min-width:120px}
+  #verdict.ok{color:var(--ok)} #verdict.bad{color:var(--bad)} #verdict.err{color:var(--bad)}
+  #diagramWrap{overflow:auto}
+  #diagramWrap svg{display:block;min-width:100%}
+  .stats{color:var(--dim);font-size:12px;margin-top:8px}
+  #selftest{font-size:12px}
+  #selftest .t{display:flex;gap:8px;padding:2px 0}
+  .t .pass{color:var(--ok)} .t .fail{color:var(--bad)}
+  .t .msg{color:var(--dim)}
+  footer{color:var(--dim);font-size:11px;margin-top:20px;text-align:center}
+</style>
+</head>
+<body>
+<h1>Rx<span>Forge</span> — 正则铁路图锻造炉</h1>
+<div class="sub">正则 → AST → Thompson NFA → 铁路图（syntax diagram）· 零依赖 · 离线单文件</div>
+
+<div class="panel">
+  <div class="row">
+    <label>正则</label>
+    <input type="text" id="rx" value="a(b|c)*d" spellcheck="false">
+  </div>
+  <div class="row presets">
+    <label>预设</label>
+    <button data-rx="a(b|c)*d">a(b|c)*d</button>
+    <button data-rx="(ab)+c">(ab)+c</button>
+    <button data-rx="colou?r">colou?r</button>
+    <button data-rx="(x|y)?z*">(x|y)?z*</button>
+    <button data-rx="(cat|dog)s?">(cat|dog)s?</button>
+    <button data-rx="a.b">a.b</button>
+  </div>
+  <div class="row">
+    <label>测试串</label>
+    <input type="text" id="test" value="abcbccd" spellcheck="false">
+    <span id="verdict">—</span>
+  </div>
+  <div class="stats" id="stats"></div>
+</div>
+
+<div class="panel">
+  <div id="diagramWrap"></div>
+</div>
+
+<div class="panel">
+  <div class="row"><b>内置自检</b><button id="runTest">重新运行</button></div>
+  <div id="selftest"></div>
+</div>
+
+<footer>RxForge · Thompson 构造 · ε-NFA 模拟 · 与 JS RegExp 引擎交叉验证 · CJX0712</footer>
+
+<script id="engine">
+const Rx = (function(){
+  'use strict';
+
+  /* ---------- Parser: regex source -> AST ---------- */
+  // node types: empty | char{ch} | any | cat{a,b} | alt{a,b} | star{a} | plus{a} | opt{a}
+  function parse(src){
+    let i = 0;
+    function peek(){ return src[i]; }
+    function parseAlt(){
+      let a = parseCat();
+      while (peek() === '|'){ i++; a = { t:'alt', a, b: parseCat() }; }
+      return a;
+    }
+    function parseCat(){
+      let a = parsePost();
+      while (i < src.length && peek() !== '|' && peek() !== ')'){
+        a = { t:'cat', a, b: parsePost() };
+      }
+      return a;
+    }
+    function parsePost(){
+      let a = parseAtom();
+      while (i < src.length && (peek() === '*' || peek() === '+' || peek() === '?')){
+        const op = src[i++];
+        a = op === '*' ? { t:'star', a } : op === '+' ? { t:'plus', a } : { t:'opt', a };
+      }
+      return a;
+    }
+    function parseAtom(){
+      const c = src[i];
+      if (c === undefined) throw new Error('unexpected end of pattern');
+      if (c === '('){ i++; const a = parseAlt(); if (src[i] !== ')') throw new Error('missing )'); i++; return a; }
+      if (c === '.') { i++; return { t:'any' }; }
+      if (c === '\\'){ i++; const e = src[i]; if (e === undefined) throw new Error('dangling escape'); i++; return { t:'char', ch: e }; }
+      if ('*+?'.includes(c)) throw new Error('nothing to repeat at ' + i);
+      if (c === ')') throw new Error('unmatched )');
+      if (c === '|') throw new Error('unexpected |');
+      i++; return { t:'char', ch: c };
+    }
+    if (src.length === 0) return { t:'empty' };
+    const ast = parseAlt();
+    if (i < src.length) throw new Error('unexpected ' + src[i]);
+    return ast;
+  }
+
+  /* ---------- Thompson construction: AST -> NFA ---------- */
+  // states: eps adjacency + char transitions ('.' matches any one char)
+  // state count invariant: char/any/empty +0, cat +0, alt/star/plus +2, opt +1
+  function toNFA(ast){
+    let n = 0;
+    const eps = [], ch = [];
+    function ns(){ eps.push([]); ch.push([]); return n++; }
+    function build(node, s, e){
+      switch (node.t){
+        case 'empty': eps[s].push(e); break;
+        case 'char':  ch[s].push({ ch: node.ch, to: e, any: false }); break;
+        case 'any':   ch[s].push({ ch: '', to: e, any: true }); break;
+        case 'cat': { const m = ns(); build(node.a, s, m); build(node.b, m, e); break; }
+        case 'alt': { const p = ns(), q = ns(); eps[s].push(p, q); build(node.a, p, e); build(node.b, q, e); break; }
+        case 'star': { const sp = ns(), bp = ns(); eps[s].push(sp, e); eps[sp].push(bp, e); build(node.a, bp, sp); break; }
+        case 'plus': { const sp = ns(), bp = ns(); eps[s].push(bp); eps[sp].push(bp, e); build(node.a, bp, sp); break; }
+        case 'opt':  { const sp = ns(); eps[s].push(sp, e); build(node.a, sp, e); break; }
+      }
+    }
+    const start = ns(), accept = ns();
+    build(ast, start, accept);
+    return { nStates: n, eps, ch, start, accept };
+  }
+
+  function expectedStates(ast){
+    switch (ast.t){
+      case 'char': case 'any': case 'empty': return 0;
+      case 'cat': return 1 + expectedStates(ast.a) + expectedStates(ast.b);
+      case 'alt': return 2 + expectedStates(ast.a) + expectedStates(ast.b);
+      case 'star': case 'plus': return 2 + expectedStates(ast.a);
+      case 'opt': return 1 + expectedStates(ast.a);
+    }
+  }
+
+  /* ---------- ε-closure & simulation ---------- */
+  function epsilonClosure(nfa, states){
+    const seen = new Array(nfa.nStates).fill(false);
+    const stack = [], out = [];
+    for (const s of states){ if (!seen[s]){ seen[s] = true; stack.push(s); } }
+    while (stack.length){
+      const s = stack.pop();
+      out.push(s);
+      for (const t of nfa.eps[s]) if (!seen[t]){ seen[t] = true; stack.push(t); }
+    }
+    return out.sort((a, b) => a - b);
+  }
+  function step(nfa, states, c){
+    const nxt = new Set();
+    for (const s of states)
+      for (const tr of nfa.ch[s])
+        if (tr.any || tr.ch === c) nxt.add(tr.to);
+    return epsilonClosure(nfa, [...nxt]);
+  }
+  function accepts(nfa, str){
+    let cur = epsilonClosure(nfa, [nfa.start]);
+    for (const c of str){
+      cur = step(nfa, cur, c);
+      if (cur.length === 0) return false;
+    }
+    return cur.indexOf(nfa.accept) !== -1;
+  }
+  function compile(src){
+    const ast = parse(src);
+    return { ast, nfa: toNFA(ast) };
+  }
+
+  /* ---------- AST utilities ---------- */
+  function astDepth(node){
+    switch (node.t){
+      case 'char': case 'any': case 'empty': return 1;
+      case 'cat': case 'alt': return 1 + Math.max(astDepth(node.a), astDepth(node.b));
+      default: return 1 + astDepth(node.a);
+    }
+  }
+  function astToText(node, indent){
+    indent = indent || 0;
+    const pad = '  '.repeat(indent);
+    switch (node.t){
+      case 'char': return pad + 'char ' + JSON.stringify(node.ch);
+      case 'any': return pad + 'any .';
+      case 'empty': return pad + 'empty';
+      case 'cat': case 'alt':
+        return pad + node.t + '\n' + astToText(node.a, indent + 1) + '\n' + astToText(node.b, indent + 1);
+      default:
+        return pad + node.t + '\n' + astToText(node.a, indent + 1);
+    }
+  }
+
+  /* ---------- Railway diagram (SVG) ---------- */
+  const NW = 42, NH = 34, GAP = 20, BGAP = 16, LOOP = 20, BYP = 20;
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function box(x, y, w, h, label){
+    return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="8" ' +
+      'fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>' +
+      '<text x="' + (x + w/2) + '" y="' + (y + h/2 + 4.5) + '" text-anchor="middle" fill="#e6edf3" font-size="13">' + esc(label) + '</text>';
+  }
+  function ln(x1, y1, x2, y2, arrow){
+    return '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" stroke="#d2a8ff" stroke-width="1.5"' +
+      (arrow ? ' marker-end="url(#arr)"' : '') + '/>';
+  }
+  function loopArc(x1, y, x2, top, arrow){
+    // exit (x2,y) arcs up over to entry (x1,y) — drawn right-to-left, arrow at entry
+    const midY = y - top;
+    return '<path d="M ' + x2 + ' ' + y + ' C ' + x2 + ' ' + midY + ', ' + x1 + ' ' + midY + ', ' + x1 + ' ' + (y - 2) + '" ' +
+      'fill="none" stroke="#f0883e" stroke-width="1.5" stroke-dasharray="5 3"' + (arrow ? ' marker-end="url(#arr)"' : '') + '/>';
+  }
+  function bypassPath(x1, y, x2, bot, arrow){
+    const midY = y + bot;
+    return '<path d="M ' + x1 + ' ' + y + ' L ' + x1 + ' ' + midY + ' L ' + x2 + ' ' + midY + ' L ' + x2 + ' ' + (y + 2) + '" ' +
+      'fill="none" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 3"' + (arrow ? ' marker-end="url(#arr)"' : '') + '/>';
+  }
+
+  // each layout: {w, h, svg} — content vertically centered at h/2, entry at left edge, exit at right edge
+  function layout(node){
+    switch (node.t){
+      case 'char': case 'any': {
+        const label = node.t === 'any' ? '·' : node.ch;
+        const w = Math.max(NW, 18 + label.length * 10);
+        return { w, h: NH, svg: box(0, 0, w, NH, label) };
+      }
+      case 'empty': return { w: 0, h: NH, svg: '' };
+      case 'cat': {
+        const A = layout(node.a), B = layout(node.b);
+        const h = Math.max(A.h, B.h);
+        return { w: A.w + GAP + B.w, h,
+          svg: '<g transform="translate(0,' + ((h - A.h)/2) + ')">' + A.svg + '</g>' +
+               ln(A.w, h/2, A.w + GAP, h/2, false) +
+               '<g transform="translate(' + (A.w + GAP) + ',' + ((h - B.h)/2) + ')">' + B.svg + '</g>' };
+      }
+      case 'alt': {
+        const A = layout(node.a), B = layout(node.b);
+        const inner = Math.max(A.w, B.w) + 8;
+        const w = inner + 48;
+        const x0 = 14, x1 = w - 14;
+        const aMid = A.h/2, bMid = A.h + BGAP + B.h/2;
+        const midY = (aMid + bMid)/2;
+        const h = A.h + BGAP + B.h;
+        const svg =
+          ln(0, midY, x0, midY, false) +
+          ln(x0, aMid, x0, bMid, false) +
+          ln(x0, aMid, x0 + 10, aMid, false) +
+          ln(x0, bMid, x0 + 10, bMid, false) +
+          '<g transform="translate(' + (x0 + 10) + ',' + (aMid - A.h/2) + ')">' + A.svg + '</g>' +
+          '<g transform="translate(' + (x0 + 10) + ',' + (bMid - B.h/2) + ')">' + B.svg + '</g>' +
+          ln(x0 + 10 + inner - 8, aMid, x1, aMid, false) +
+          ln(x0 + 10 + inner - 8, bMid, x1, bMid, false) +
+          ln(x1, aMid, x1, bMid, false) +
+          ln(x1, midY, w, midY, false);
+        return { w, h, svg };
+      }
+      case 'star': case 'plus': case 'opt': {
+        const C = layout(node.a);
+        const isStar = node.t === 'star', isOpt = node.t === 'opt';
+        const top = isOpt ? 0 : LOOP, bot = (isStar || isOpt) ? BYP : 0;
+        const h = C.h + top + bot;
+        const bodyY = top;
+        const midY = h/2;
+        const w = C.w + 24;
+        const bx = 12;
+        let svg = ln(0, midY, bx, midY, false) +
+          '<g transform="translate(' + bx + ',' + bodyY + ')">' + C.svg + '</g>' +
+          ln(bx + C.w, midY, w, midY, isOpt ? true : false);
+        if (!isOpt) svg += loopArc(bx, midY, bx + C.w, top + 6, true);
+        if (isStar || isOpt) svg += bypassPath(bx, midY, bx + C.w, bot + 4, !isOpt);
+        return { w, h, svg };
+      }
+    }
+  }
+  function diagram(node){
+    const L = layout(node);
+    const tw = L.w + 76, th = L.h + 24;
+    const x0 = 20, x1 = tw - 20, my = th/2;
+    const svg =
+      '<svg width="' + tw + '" height="' + th + '" viewBox="0 0 ' + tw + ' ' + th + '" xmlns="http://www.w3.org/2000/svg">' +
+      '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+      '<path d="M 0 0 L 10 5 L 0 10 z" fill="#d2a8ff"/></marker></defs>' +
+      '<circle cx="' + x0 + '" cy="' + my + '" r="5" fill="#3fb950"/>' +
+      ln(x0 + 5, my, x0 + 20, my, false) +
+      '<g transform="translate(' + (x0 + 20) + ',12)">' + L.svg + '</g>' +
+      ln(tw - 40, my, tw - 25, my, false) +
+      '<circle cx="' + (tw - 20) + '" cy="' + my + '" r="7" fill="none" stroke="#f85149" stroke-width="1.5"/>' +
+      '<circle cx="' + (tw - 20) + '" cy="' + my + '" r="3.5" fill="#f85149"/>' +
+      '</svg>';
+    return { w: tw, h: th, svg };
+  }
+
+  return { parse, toNFA, expectedStates, epsilonClosure, step, accepts, compile, astDepth, astToText, diagram };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = Rx;
+</script>
+
+<script>
+(function(){
+  'use strict';
+  const $ = id => document.getElementById(id);
+  let current = null;
+
+  function render(){
+    const src = $('rx').value;
+    const verdict = $('verdict');
+    try {
+      current = Rx.compile(src);
+      verdict.className = '';
+      verdict.textContent = '已编译';
+      $('stats').textContent =
+        'AST 深度 ' + Rx.astDepth(current.ast) +
+        ' · NFA 状态 ' + current.nfa.nStates +
+        ' （公式 ' + Rx.expectedStates(current.ast) + '）';
+      $('diagramWrap').innerHTML = Rx.diagram(current.ast).svg;
+    } catch (e){
+      current = null;
+      verdict.className = 'err';
+      verdict.textContent = '✗ ' + e.message;
+      $('diagramWrap').innerHTML = '';
+      $('stats').textContent = '';
+      return;
+    }
+    testStr();
+  }
+
+  function testStr(){
+    const verdict = $('verdict');
+    if (!current){ return; }
+    const s = $('test').value;
+    const hit = Rx.accepts(current.nfa, s);
+    verdict.className = hit ? 'ok' : 'bad';
+    verdict.textContent = hit ? '✓ 匹配' : '✗ 不匹配';
+  }
+
+  $('rx').addEventListener('input', render);
+  $('test').addEventListener('input', testStr);
+  document.querySelectorAll('.presets button').forEach(b =>
+    b.addEventListener('click', () => { $('rx').value = b.dataset.rx; render(); }));
+
+  /* ---------- in-page self-test ---------- */
+  const T = (name, ok, msg) => ({ name, ok, msg });
+  function selfTest(){
+    const results = [];
+    try {
+      // 1) known vectors
+      const cases = [
+        ['a(b|c)*d', 'abd', true], ['a(b|c)*d', 'ad', true], ['a(b|c)*d', 'abcbccd', true],
+        ['a(b|c)*d', 'abx', false], ['a(b|c)*d', 'db', false],
+        ['(ab)+c', 'abc', true], ['(ab)+c', 'ababc', true], ['(ab)+c', 'c', false], ['(ab)+c', 'ab', false],
+        ['colou?r', 'color', true], ['colou?r', 'colour', true], ['colou?r', 'colouur', false],
+        ['(x|y)?z*', '', true], ['(x|y)?z*', 'xz', true], ['(x|y)?z*', 'zz', true], ['(x|y)?z*', 'xy', false],
+        ['a.b', 'axb', true], ['a.b', 'ab', false],
+        ['a*', '', true], ['a+', '', false]
+      ];
+      let ok = true;
+      for (const [p, s, want] of cases){
+        const got = Rx.accepts(Rx.compile(p).nfa, s);
+        if (got !== want) { ok = false; results.push(T(p + ' ~ ' + JSON.stringify(s), false, 'want ' + want + ' got ' + got)); }
+      }
+      results.push(T('已知向量 ' + cases.length + ' 例', ok, ''));
+      // 2) state-count invariant
+      ok = true;
+      for (const p of ['a(b|c)*d', '(ab)+c', 'colou?r', '(x|y)?z*', '(cat|dog)s?']){
+        const c = Rx.compile(p);
+        if (c.nfa.nStates !== Rx.expectedStates(c.ast)) ok = false;
+      }
+      results.push(T('NFA 状态数 = Thompson 公式', ok, ''));
+      // 3) cross-check vs JS RegExp (independent engine)
+      ok = true;
+      const rng = (function(){ let s = 42; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+      const alpha = 'abc';
+      for (const p of ['a(b|c)*d', '(ab)+c', '(a|b)*abb', 'a*b*c*']){
+        const nfa = Rx.compile(p).nfa;
+        const re = new RegExp('^(' + p.replace(/\//g, '') + ')$');
+        for (let k = 0; k < 120; k++){
+          const len = Math.floor(rng() * 7);
+          let s = '';
+          for (let j = 0; j < len; j++) s += alpha[Math.floor(rng() * 3)];
+          if (Rx.accepts(nfa, s) !== re.test(s)) { ok = false; break; }
+        }
+      }
+      results.push(T('与 JS RegExp 交叉验证（4 模式 × 120 随机串）', ok, ''));
+    } catch (e){
+      results.push(T('selftest crashed', false, e.message));
+    }
+    $('selftest').innerHTML = results.map(r =>
+      '<div class="t"><span class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? '✓' : '✗') + '</span>' +
+      '<span>' + r.name + '</span>' + (r.msg ? '<span class="msg">' + r.msg + '</span>' : '') + '</div>').join('');
+  }
+  $('runTest').addEventListener('click', selfTest);
+
+  render();
+  selfTest();
+})();
+</script>
+</body>
+</html>
