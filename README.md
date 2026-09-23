@@ -1,5 +1,12 @@
 # RxForge — 正则铁路图锻造炉
 
+<p align="center">
+  <a href="https://github.com/CJX0712/rx-forge/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/rx-forge/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/rx-forge/releases"><img src="https://img.shields.io/github/v/release/CJX0712/rx-forge?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/rx-forge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/rx-forge" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 单文件、零依赖、离线运行的正则表达式可视化工具：把正则解析成 AST，用 **Thompson 构造**编译成 ε-NFA，并渲染成经典**铁路图**（syntax diagram）。内置实时匹配测试与不变量自检。
 
 ## 打开方式
